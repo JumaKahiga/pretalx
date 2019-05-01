@@ -9,7 +9,6 @@ from django.utils.functional import cached_property
 from django.utils.timezone import now, override as tzoverride
 from django.utils.translation import override, ugettext_lazy as _
 
-from pretalx.agenda.tasks import export_schedule_html
 from pretalx.common.mixins import LogMixin
 from pretalx.common.urls import EventUrls
 from pretalx.mail.context import template_context_from_event
@@ -39,64 +38,6 @@ class Schedule(LogMixin, models.Model):
 
     class urls(EventUrls):
         public = '{self.event.urls.schedule}v/{self.url_version}/'
-
-    @transaction.atomic
-    def freeze(self, name: str, user=None, notify_speakers: bool=True):
-        """Releases the current WIP schedule as a fixed schedule version.
-
-        :param name: The new schedule name. May not be in use in this event,
-            and cannot be 'wip' or 'latest'.
-        :param user: The :class:`~pretalx.person.models.user.User` initiating
-            the freeze.
-        :param notify_speakers: Should notification emails for speakers with
-            changed slots be generated?
-        :rtype: Schedule
-        """
-        from pretalx.schedule.models import TalkSlot
-
-        if name in ['wip', 'latest']:
-            raise Exception(f'Cannot use reserved name "{name}" for schedule version.')
-        if self.version:
-            raise Exception(
-                f'Cannot freeze schedule version: already versioned as "{self.version}".'
-            )
-        if not name:
-            raise Exception('Cannot create schedule version without a version name.')
-
-        self.version = name
-        self.published = now()
-        self.save(update_fields=['published', 'version'])
-        self.log_action('pretalx.schedule.release', person=user, orga=True)
-
-        wip_schedule = Schedule.objects.create(event=self.event)
-
-        # Set visibility
-        self.talks.filter(
-            start__isnull=False,
-            submission__state=SubmissionStates.CONFIRMED,
-            is_visible=False,
-        ).update(is_visible=True)
-        self.talks.filter(is_visible=True).exclude(
-            start__isnull=False, submission__state=SubmissionStates.CONFIRMED
-        ).update(is_visible=False)
-
-        talks = []
-        for talk in self.talks.select_related('submission', 'room').all():
-            talks.append(talk.copy_to_schedule(wip_schedule, save=False))
-        TalkSlot.objects.bulk_create(talks)
-
-        if notify_speakers:
-            self.notify_speakers()
-
-        with suppress(AttributeError):
-            del wip_schedule.event.wip_schedule
-        with suppress(AttributeError):
-            del wip_schedule.event.current_schedule
-
-        if self.event.settings.export_html_on_schedule_release:
-            export_schedule_html.apply_async(kwargs={'event_id': self.event.id})
-
-        return self, wip_schedule
 
     @transaction.atomic
     def unfreeze(self, user=None):
@@ -152,97 +93,9 @@ class Schedule(LogMixin, models.Model):
             queryset = queryset.filter(published__lt=self.published)
         return queryset.order_by('-published').first()
 
-    def _handle_submission_move(self, submission_pk, old_slots, new_slots):
-        new = []
-        canceled = []
-        moved = []
-        all_old_slots = list(old_slots.filter(submission__pk=submission_pk))
-        all_new_slots = list(new_slots.filter(submission__pk=submission_pk))
-        old_slots = [slot for slot in all_old_slots if not any(slot.is_same_slot(other_slot) for other_slot in all_new_slots)]
-        new_slots = [slot for slot in all_new_slots if not any(slot.is_same_slot(other_slot) for other_slot in all_old_slots)]
-        diff = len(old_slots) - len(new_slots)
-        if diff > 0:
-            canceled = old_slots[:diff]
-            old_slots = old_slots[diff:]
-        elif diff < 0:
-            diff = -diff
-            new = new_slots[:diff]
-            new_slots = new_slots[diff:]
-        for move in zip(old_slots, new_slots):
-            old_slot = move[0]
-            new_slot = move[1]
-            moved.append({
-                'submission': new_slot.submission,
-                'old_start': old_slot.start.astimezone(self.tz),
-                'new_start': new_slot.start.astimezone(self.tz),
-                'old_room': old_slot.room.name,
-                'new_room': new_slot.room.name,
-                'new_info': new_slot.room.speaker_info,
-            })
-        return new, canceled, moved
-
     @cached_property
     def tz(self):
         return pytz.timezone(self.event.timezone)
-
-    @cached_property
-    def changes(self) -> dict:
-        """Returns a dictionary of changes when compared to the previous version.
-
-        The ``action`` field is either ``create`` or ``update``. If it's an
-        update, the ``count`` integer, and the ``new_talks``,
-        ``canceled_talks`` and ``moved_talks`` lists are also present."""
-        result = {
-            'count': 0,
-            'action': 'update',
-            'new_talks': [],
-            'canceled_talks': [],
-            'moved_talks': [],
-        }
-        if not self.previous_schedule:
-            result['action'] = 'create'
-            return result
-
-        old_slots = self.previous_schedule.scheduled_talks
-        new_slots = self.scheduled_talks
-        old_slot_set = set(old_slots.values_list('submission', 'room', 'start', named=True))
-        new_slot_set = set(new_slots.values_list('submission', 'room', 'start', named=True))
-        old_submissions = set(old_slots.values_list('submission__id', flat=True))
-        new_submissions = set(new_slots.values_list('submission__id', flat=True))
-        handled_submissions = set()
-
-        moved_or_missing = old_slot_set - new_slot_set
-        moved_or_new = new_slot_set - old_slot_set
-
-        for entry in moved_or_missing:
-            if entry.submission in handled_submissions:
-                continue
-            if entry.submission not in new_submissions:
-                result['canceled_talks'] += list(old_slots.filter(submission__pk=entry.submission))
-            else:
-                new, canceled, moved = self._handle_submission_move(entry.submission, old_slots, new_slots)
-                result['new_talks'] += new
-                result['canceled_talks'] += canceled
-                result['moved_talks'] += moved
-            handled_submissions.add(entry.submission)
-        for entry in moved_or_new:
-            if entry.submission in handled_submissions:
-                continue
-            if entry.submission not in old_submissions:
-                result['new_talks'] += list(new_slots.filter(submission__pk=entry.submission))
-            else:
-                new, canceled, moved = self._handle_submission_move(entry.submission, old_slots, new_slots)
-                result['new_talks'] += new
-                result['canceled_talks'] += canceled
-                result['moved_talks'] += moved
-            handled_submissions.add(entry.submission)
-
-        result['count'] = (
-            len(result['new_talks'])
-            + len(result['canceled_talks'])
-            + len(result['moved_talks'])
-        )
-        return result
 
     @cached_property
     def warnings(self) -> dict:
@@ -270,57 +123,6 @@ class Schedule(LogMixin, models.Model):
             if talk.submission.event.settings.use_tracks and not talk.submission.track:
                 warnings['no_track'].append(talk)
         return warnings
-
-    @cached_property
-    def speakers_concerned(self):
-        """Returns a dictionary of speakers with their new and changed talks in this schedule.
-
-        Each speaker is assigned a dictionary with ``create`` and ``update``
-        fields, each containing a list of submissions.
-        """
-        if self.changes['action'] == 'create':
-            return {
-                speaker: {
-                    'create': self.talks.filter(submission__speakers=speaker),
-                    'update': [],
-                }
-                for speaker in User.objects.filter(submissions__slots__schedule=self)
-            }
-
-        if self.changes['count'] == len(self.changes['canceled_talks']):
-            return []
-
-        speakers = defaultdict(lambda: {'create': [], 'update': []})
-        for new_talk in self.changes['new_talks']:
-            for speaker in new_talk.submission.speakers.all():
-                speakers[speaker]['create'].append(new_talk)
-        for moved_talk in self.changes['moved_talks']:
-            for speaker in moved_talk['submission'].speakers.all():
-                speakers[speaker]['update'].append(moved_talk)
-        return speakers
-
-    @cached_property
-    def notifications(self):
-        """A list of unsaved :class:`~pretalx.mail.models.QueuedMail` objects to be sent on schedule release."""
-        mails = []
-        for speaker in self.speakers_concerned:
-            with override(speaker.locale), tzoverride(self.tz):
-                notifications = get_template(
-                    'schedule/speaker_notification.txt'
-                ).render({'speaker': speaker, **self.speakers_concerned[speaker]})
-            context = template_context_from_event(self.event)
-            context['notifications'] = notifications
-            mails.append(
-                self.event.update_template.to_mail(
-                    user=speaker, event=self.event, context=context, commit=False
-                )
-            )
-        return mails
-
-    def notify_speakers(self):
-        """Save the ``notifications`` :class:`~pretalx.mail.models.QueuedMail` objects to the outbox."""
-        for notification in self.notifications:
-            notification.save()
 
     @cached_property
     def url_version(self):
